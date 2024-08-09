@@ -44,16 +44,6 @@ class Detect(nn.Module):
         """Concatenates and returns predicted bounding boxes and class probabilities."""
         shape = x[0].shape  # BCHW
 
-        if self.export and self.format == 'rknn':
-            y = []
-            for i in range(self.nl):
-                y.append(self.cv2[i](x[i]))
-                cls = torch.sigmoid(self.cv3[i](x[i]))
-                cls_sum = torch.clamp(cls.sum(1, keepdim=True), 0, 1)
-                y.append(cls)
-                y.append(cls_sum)
-            return y
-
         for i in range(self.nl):
             x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)
         if self.training:
@@ -63,14 +53,14 @@ class Detect(nn.Module):
             self.shape = shape
 
         x_cat = torch.cat([xi.view(shape[0], self.no, -1) for xi in x], 2)
-        if self.export and self.format in ('saved_model', 'pb', 'tflite', 'edgetpu', 'tfjs'):  # avoid TF FlexSplitV ops
+        if self.export and self.format in ('saved_model', 'pb', 'tflite', 'edgetpu', 'tfjs', 'rknn'):  # avoid TF FlexSplitV ops
             box = x_cat[:, :self.reg_max * 4]
             cls = x_cat[:, self.reg_max * 4:]
         else:
             box, cls = x_cat.split((self.reg_max * 4, self.nc), 1)
         dbox = dist2bbox(self.dfl(box), self.anchors.unsqueeze(0), xywh=True, dim=1) * self.strides
 
-        if self.export and self.format in ('tflite', 'edgetpu'):
+        if self.export and self.format in ('tflite', 'edgetpu', 'rknn'):
             # Normalize xywh with image size to mitigate quantization error of TFLite integer models as done in YOLOv5:
             # https://github.com/ultralytics/yolov5/blob/0c8de3fca4a702f8ff5c435e67f378d1fce70243/models/tf.py#L307-L309
             # See this PR for details: https://github.com/ultralytics/ultralytics/pull/1695
@@ -146,19 +136,27 @@ class Pose(Detect):
     def forward(self, x):
         """Perform forward pass through YOLO model and return predictions."""
         bs = x[0].shape[0]  # batch size
+        shape = x[0].shape  # BCHW
+        
         kpt = torch.cat([self.cv4[i](x[i]).view(bs, self.nk, -1) for i in range(self.nl)], -1)  # (bs, 17*3, h*w)
         x = self.detect(self, x)
         if self.training:
             return x, kpt
-        pred_kpt = self.kpts_decode(bs, kpt)
+        pred_kpt = self.kpts_decode(bs, kpt, shape)
         return torch.cat([x, pred_kpt], 1) if self.export else (torch.cat([x[0], pred_kpt], 1), (x[1], kpt))
 
-    def kpts_decode(self, bs, kpts):
+    def kpts_decode(self, bs, kpts, imgsz):
         """Decodes keypoints."""
         ndim = self.kpt_shape[1]
         if self.export:  # required for TFLite export to avoid 'PLACEHOLDER_FOR_GREATER_OP_CODES' bug
             y = kpts.view(bs, *self.kpt_shape, -1)
-            a = (y[:, :, :2] * 2.0 + (self.anchors - 0.5)) * self.strides
+            if self.format == 'rknn':
+                img_w = imgsz[3] * self.stride[0]
+                img_h = imgsz[2] * self.stride[0]
+                img_size = torch.tensor([img_w, img_h], device=y.device).reshape(1, 1, 2, 1)
+                a = ((y[:, :, :2] * 2.0 + (self.anchors - 0.5)) * self.strides) / img_size
+            else:
+                a = (y[:, :, :2] * 2.0 + (self.anchors - 0.5)) * self.strides
             if ndim == 3:
                 a = torch.cat((a, y[:, :, 2:3].sigmoid()), 2)
             return a.view(bs, self.nk, -1)
